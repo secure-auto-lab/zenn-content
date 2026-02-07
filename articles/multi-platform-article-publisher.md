@@ -10,7 +10,7 @@ published: false
 
 **「Note、Zenn、Qiita、ブログ……毎回コピペするの、もう限界だ。」**
 
-1つのMarkdownファイルから4プラットフォームに同時投稿できるCLIツールを作り、**記事公開にかかる作業時間を90%以上削減**しました。この記事では、その設計と実装を全て公開します。
+1つのMarkdownファイルから4プラットフォームに同時投稿できるCLIツールを作り、**記事公開にかかる作業時間を90%以上削減**しました。この記事では、その設計と実装を解説します。
 
 ---
 
@@ -167,13 +167,14 @@ announcement:
 - Zenn固有の `emoji` や `topics`、Note固有の `price` など、プラットフォーム特有の設定を吸収
 - `announcement` でSNS告知もfrontmatterで制御
 
-これを **Pydantic** でバリデーションすることで、設定ミスを早期検出しています。
+これを **dataclass** でバリデーションすることで、設定ミスを早期検出しています。
 
 ```python
-class ZennPlatformConfig(BaseModel):
+@dataclass
+class ZennPlatformConfig:
     enabled: bool = True
     emoji: str = "📝"
-    topics: list[str] = []
+    topics: list[str] = field(default_factory=list)
     article_type: str = "tech"  # "tech" or "idea"
 ```
 
@@ -186,138 +187,291 @@ class ZennPlatformConfig(BaseModel):
 | frontmatter | 独自形式 | なし | なし | Astro形式 |
 | タグ | `topics` (配列) | UI操作 | `tags` (オブジェクト配列) | `tags` (配列) |
 | 画像 | 相対パス | アップロード | アップロード | public/ |
-| 有料部分 | × | `:::message-only` | × | × |
+| 有料部分 | - | `:::message-only` | - | - |
 
-これらの差分を **Converter** クラスで吸収しています。
+これらの差分を **Converter** クラスで吸収しています。コンバーターはプラットフォーム固有のブロック（`"
+        def replacer(match):
+            if match.group(1) == keep:
+                return match.group(2)
+            return ""
+        return re.sub(pattern, replacer, content, flags=re.DOTALL)
 
-```python
-class ZennConverter:
+
+class NoteConverter(PlatformConverter):
     def convert(self, article: Article) -> str:
-        """Article → Zenn形式のMarkdownに変換"""
-        frontmatter = {
-            "title": article.title,
-            "emoji": article.platforms.zenn.emoji,
-            "type": article.platforms.zenn.article_type,
-            "topics": article.platforms.zenn.topics,
-            "published": True,
-        }
-        return f"---\n{yaml.dump(frontmatter)}---\n\n{article.content}"
+        content = self._strip_platform_blocks(article.content, "note")
+        return re.sub(
+            r"```mermaid\n(.*?)\n```",
+            "[図: 画像に変換が必要です]",
+            content, flags=re.DOTALL,
+        )
+
+
+class ZennConverter(PlatformConverter):
+    def convert(self, article: Article) -> str:
+        content = self._strip_platform_blocks(article.content, "zenn")
+        topics = ", ".join(
+            f'"{t}"' for t in article.platforms.zenn.topics[:5]
+        )
+        fm = f'''---
+title: "{article.title}"
+emoji: "{article.platforms.zenn.emoji}"
+type: "{article.platforms.zenn.article_type}"
+topics: [{topics}]
+published: true
+---'''
+        return f"{fm}\n\n{content}"
+
+
+class BlogConverter(PlatformConverter):
+    def convert(self, article: Article) -> str:
+        content = self._strip_platform_blocks(article.content, "blog")
+        tags = ", ".join(f'"{t}"' for t in article.tags)
+        fm = f'''---
+title: "{article.title}"
+description: "{article.description}"
+pubDate: "{article.created_at.strftime('%Y-%m-%d')}"
+tags: [{tags}]
+author: "{article.author}"
+---'''
+        return f"{fm}\n\n{content}"
 ```
 
-### Step 3: プラットフォーム別Publisher
+---
 
-各プラットフォームの投稿方法は大きく異なります。
-
-#### Zenn — Git pushで自動デプロイ
-
-Zennは **GitHubリポジトリ連携** が最もシンプルです。
+### 3. Zenn Publisher（zenn.py）— Git操作
 
 ```python
+import os
+import subprocess
+from pathlib import Path
+from .base import Publisher, PublishResult
+from ..transformer.article import Article
+
+
 class ZennPublisher(Publisher):
+    platform_name = "zenn"
+
+    def __init__(self, zenn_content_path=None):
+        self.content_path = Path(
+            zenn_content_path
+            or os.getenv("ZENN_CONTENT_PATH", "./zenn-content")
+        )
+        self.articles_path = self.content_path / "articles"
+
     async def publish(self, article, content):
-        # 1. zenn-content/articles/ にファイルを書き出し
-        article_file = self.articles_path / f"{article.slug}.md"
-        article_file.write_text(content, encoding="utf-8")
+        self.articles_path.mkdir(parents=True, exist_ok=True)
+        file = self.articles_path / f"{article.slug}.md"
+        file.write_text(content, encoding="utf-8")
 
-        # 2. git add → commit → push
-        await self._git_push(article.slug, f"Add article: {article.title}")
+        if await self._git_push(article.slug, f"Add: {article.title}"):
+            user = os.getenv("ZENN_USERNAME", "tinou")
+            url = f"https://zenn.dev/{user}/articles/{article.slug}"
+            return PublishResult.success_result("zenn", url)
+        return PublishResult.failure_result("zenn", "Git push failed")
 
-        # 3. Zennが自動デプロイ（1-2分）
-        return f"https://zenn.dev/{username}/articles/{article.slug}"
+    async def _git_push(self, slug, msg):
+        try:
+            cwd = str(self.content_path)
+            for cmd in [
+                ["git", "add", f"articles/{slug}.md"],
+                ["git", "commit", "-m", msg],
+                ["git", "push", "origin", "main"],
+            ]:
+                subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
 ```
 
-GitHubにpushするだけでZennが自動的にデプロイしてくれるため、API認証は不要です。
+---
 
-#### Note — Playwrightでブラウザ自動操作
-
-NoteにはAPIがないため、**Playwright**（ブラウザ自動化）で投稿します。
+### 4. Note Publisher（note.py）— Playwright自動化
 
 ```python
+import asyncio
+import json
+import os
+from pathlib import Path
+from playwright.async_api import async_playwright
+from .base import Publisher, PublishResult
+
+
 class NotePublisher(Publisher):
+    platform_name = "note"
+
+    def __init__(self, email=None, password=None, headless=True):
+        self.email = email or os.getenv("NOTE_EMAIL")
+        self.password = password or os.getenv("NOTE_PASSWORD")
+        self.cookies_path = Path("./.note_cookies.json")
+        self.headless = headless
+
     async def publish(self, article, content):
         async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
+            browser = await p.chromium.launch(headless=self.headless)
+            ctx = await browser.new_context()
 
-            # 1. ログイン
-            await self._login(page)
+            if self.cookies_path.exists():
+                cookies = json.loads(self.cookies_path.read_text())
+                await ctx.add_cookies(cookies)
 
-            # 2. 新規記事作成ページへ
-            await page.goto("https://note.com/new")
+            page = await ctx.new_page()
 
-            # 3. タイトル・本文を入力
-            await page.fill('[placeholder*="タイトル"]', article.title)
-            # ... 本文入力、画像アップロード
+            if not await self._is_logged_in(page):
+                await self._login(page)
+                cookies = await ctx.cookies()
+                self.cookies_path.write_text(json.dumps(cookies))
 
-            # 4. 有料設定（price > 0の場合）
-            if article.platforms.note.price > 0:
-                await self._set_price(page, article.platforms.note.price)
+            url = await self._create_article(page, article, content)
+            await browser.close()
 
-            # 5. 公開
-            await page.click('button:text("公開")')
+            if url and "/notes/new" not in url:
+                return PublishResult.success_result("note", url)
+            return PublishResult.failure_result("note", "URL取得失敗")
+
+    async def _is_logged_in(self, page):
+        await page.goto("https://note.com/")
+        await page.wait_for_load_state("networkidle")
+        await asyncio.sleep(3)
+        for sel in ['a[href*="/notes/new"]', '[class*="avatar"]']:
+            if await page.query_selector(sel):
+                return True
+        return not await page.query_selector('a[href="/login"]')
+
+    async def _login(self, page):
+        await page.goto("https://note.com/login")
+        await page.wait_for_load_state("networkidle")
+        await asyncio.sleep(2)
+        inputs = await page.query_selector_all("input")
+        if len(inputs) >= 2:
+            await inputs[0].fill(self.email)
+            await inputs[1].fill(self.password)
+        for btn in await page.query_selector_all("button"):
+            text = await btn.text_content()
+            if text and "ログイン" in text:
+                await btn.click()
+                break
+        await asyncio.sleep(5)
+
+    async def _create_article(self, page, article, content, publish=False):
+        await page.goto("https://note.com/notes/new")
+        await page.wait_for_load_state("networkidle")
+        await asyncio.sleep(3)
+
+        textarea = await page.query_selector("textarea")
+        if textarea:
+            await textarea.fill(article.title)
+
+        editor = await page.query_selector('[contenteditable="true"]')
+        if editor:
+            await editor.click()
+            for line in content.split("\n"):
+                if line.strip():
+                    await page.keyboard.type(line)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.05)
+
+        await asyncio.sleep(2)
+        for sel in ['button:has-text("下書き保存")', 'button:has-text("下書き")']:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                break
+        await asyncio.sleep(5)
+        return page.url
 ```
 
-**💡 ハマりポイント：**
-NoteのUIは頻繁に変わるため、セレクタが壊れやすいです。テスト用に `note-login` コマンドを用意して、定期的にログイン確認できるようにしました。
+---
 
-```bash
-python -m src.cli note-login  # ログインテスト
-```
-
-#### Qiita — REST API v2
-
-Qiitaは公式REST APIがあり、最もシンプルに実装できます。
+### 5. Qiita Publisher（qiita.py）— REST API
 
 ```python
+import os
+import httpx
+from .base import Publisher, PublishResult
+
+
 class QiitaPublisher(Publisher):
+    platform_name = "qiita"
+    BASE_URL = "https://qiita.com/api/v2"
+
+    def __init__(self, access_token=None):
+        self.token = access_token or os.getenv("QIITA_ACCESS_TOKEN")
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+
     async def publish(self, article, content):
-        response = await self.client.post(
-            "https://qiita.com/api/v2/items",
-            headers={"Authorization": f"Bearer {self.token}"},
-            json={
-                "title": article.title,
-                "body": content,
-                "tags": [{"name": t} for t in article.tags],
-                "private": False,
-            }
-        )
-        return response.json()["url"]
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.BASE_URL}/items",
+                headers=self.headers,
+                json={
+                    "title": article.title,
+                    "body": content,
+                    "tags": [{"name": t} for t in article.tags[:5]],
+                    "private": False,
+                },
+                timeout=30.0,
+            )
+            if resp.status_code == 201:
+                return PublishResult.success_result(
+                    "qiita", resp.json()["url"]
+                )
+            return PublishResult.failure_result(
+                "qiita", f"HTTP {resp.status_code}"
+            )
 ```
 
-### Step 4: SNS告知の自動化
+---
 
-記事を全プラットフォームに投稿した後、自動的にSNS告知を行います。
+### 6. SNS告知（service.py）
 
 ```python
-class AnnouncementService:
-    async def announce(self, article, urls):
-        message = self._format_message(article, urls)
+import os
+import tweepy
 
-        for platform in article.announcement.platforms:
-            if platform == "twitter":
-                await self.twitter.post(message)
-            elif platform == "bluesky":
-                await self.bluesky.post(message)
+
+class TwitterAnnouncer:
+    def __init__(self):
+        self._client = tweepy.Client(
+            consumer_key=os.getenv("X_API_KEY"),
+            consumer_secret=os.getenv("X_API_SECRET"),
+            access_token=os.getenv("X_ACCESS_TOKEN"),
+            access_token_secret=os.getenv("X_ACCESS_TOKEN_SECRET"),
+        )
+
+    async def post(self, message):
+        resp = self._client.create_tweet(text=message)
+        tweet_id = resp.data["id"]
+        return f"https://twitter.com/i/web/status/{tweet_id}"
 ```
 
-X（Twitter）への投稿は **tweepy**（OAuth 1.0a認証）を使用しています。Free Tierでは月間の投稿数に制限がありますが、記事告知には十分です。
+---
+
+以上が **article-publisher** の完全なソースコードです。
+
+このコードをそのまま使えば、あなたも1コマンドで複数プラットフォームに記事を投稿できるようになります。自分のプロジェクトに合わせてカスタマイズしてみてください。
+
+:::
+<!-- endplatform -->
+
+
 
 ---
 
-## 📊 技術スタック
+## 🔗 他のプラットフォームでも公開中
 
-| 要素 | 技術 |
-|------|------|
-| 言語 | Python 3.11+ |
-| CLI | Typer |
-| データモデル | Pydantic |
-| ブラウザ自動化 | Playwright |
-| HTTP通信 | httpx |
-| ブログ | Astro + Tailwind CSS |
-| ホスティング | Cloudflare Pages |
-| X投稿 | tweepy (OAuth 1.0a) |
+この記事は複数のプラットフォームで公開しています。
 
----
+| プラットフォーム | 内容 |
+|---|---|
+| **Blog** | 全文 + SEO最適化版 → [blog.secure-auto-lab.com](https://blog.secure-auto-lab.com/articles/multi-platform-article-publisher) |
+| **Note** | 全文 + 完全なソースコード（有料） → [note.com/secure_auto_lab](https://note.com/secure_auto_lab/) |
+| **X** | 最新記事の告知 → [@secure_auto_lab](https://x.com/secure_auto_lab) |
+
+フォロー・いいね・バッジで応援いただけると励みになります！
 
 ## 📝 まとめ：今日からできるアクションプラン
 
