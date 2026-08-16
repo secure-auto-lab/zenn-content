@@ -1,5 +1,5 @@
 ---
-title: "リリース3日目のQwen3.8-27BをRTX 5090で実測|ローカルLLM 5モデル×7タスク徹底比較"
+title: "2026年8月公開のQwen3.8-27BをRTX 5090で実測|ローカルLLM 5モデル×7タスク徹底比較"
 emoji: "⚡"
 type: "tech"
 topics: ["llm", "ollama", "qwen", "ai", "localllm"]
@@ -10,7 +10,7 @@ canonical: "https://blog.secure-auto-lab.com/articles/local-llm-5model-benchmark
 ![OGP](/images/local-llm-5model-benchmark-2026-ogp.png)
 
 
-# リリース3日目のQwen3.8-27BをRTX 5090で実測|ローカルLLM 5モデル×7タスク徹底比較
+# 2026年8月公開のQwen3.8-27BをRTX 5090で実測|ローカルLLM 5モデル×7タスク徹底比較
 
 **同じ27Bなのに、生成速度2.4倍。** 8月13日に公開されたばかりのQwen3.8-27Bを手持ちの4モデル+Claude Sonnet 5と比べたら、1ヶ月前に最適化したはずの構成が音を立てて崩れました。
 
